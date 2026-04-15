@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# macOS / Windows clutter
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Generated assets (kroki output, temp files)
+assets/
+*.tmp
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Locally-generated Word files (the template is the only one we track)
+*.docx
+!templates/*.docx

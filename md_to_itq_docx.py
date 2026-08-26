@@ -6,7 +6,10 @@ Works with:
   - Standard markdown (GitHub READMEs, hand-written notes, etc.)
 
 Handles:
-  # / ## / ### headings  (## -> Heading 1)
+  # / ## / ### headings  (# -> Heading 1, ## -> Heading 2; --heading-offset
+                          shifts this. Manual numbers in the heading text are
+                          kept and the style's auto-numbering is suppressed so
+                          they don't double up.)
   **bold**, *italic*, `inline code`
   - bullets          (ITQ Bullets via numId 15)
   1. numbered items  (ITQ Numbering via numId 18)
@@ -40,6 +43,13 @@ from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Cm, Emu, Inches
+
+
+# Renderer version. Bump on every behaviour change so that a document rendered
+# by a stale bundled copy is diagnosable from the file itself: it is written
+# into docProps/custom.xml as the ITQRendererVersion custom property, which
+# Word preserves across save and PDF export.
+__version__ = '1.2.0'
 
 
 # ---------- Emoji stripping ---------------------------------------------------
@@ -283,7 +293,11 @@ def render_mermaid(source, out_path):
         data=source.encode('utf-8'),
         headers={
             'Content-Type': 'text/plain',
-            'User-Agent': 'ITQ-doc-builder/1.0',
+            # kroki.io is behind Cloudflare, which 403-blocks non-browser
+            # User-Agents (error 1010). Present a browser UA.
+            'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                           'AppleWebKit/537.36 (KHTML, like Gecko) '
+                           'Chrome/124.0.0.0 Safari/537.36'),
             'Accept': 'image/png',
         },
     )
@@ -354,14 +368,31 @@ class ItqRenderer:
 
     # --- body helpers --------------------------------------------------------
 
+    def _suppress_numbering(self, para):
+        """Override the Heading style's inherited list numbering on this
+        paragraph (numId 0 = 'no numbering'). Lets headings keep the manual
+        numbers authored in the markdown without the template's auto-numbering
+        doubling them up (e.g. '3 1. About ITQ'). outlineLvl is unaffected, so
+        the TOC still nests correctly."""
+        pPr = para._p.get_or_add_pPr()
+        numPr = OxmlElement('w:numPr')
+        numId = OxmlElement('w:numId'); numId.set(qn('w:val'), '0')
+        numPr.append(numId)
+        pPr.append(numPr)
+
     def add_heading(self, level, text):
-        mapped = max(1, level - 1)
-        if mapped > 9: mapped = 9
+        """`level` is the target Word heading level (1-9) directly."""
+        mapped = min(9, max(1, level))
         p = self.d.add_paragraph(style=f'Heading {mapped}')
         render_runs(p, text)
+        self._suppress_numbering(p)
 
     def add_paragraph(self, text):
         p = self.d.add_paragraph()
+        # The template's Normal style sets space-after to 0, so consecutive
+        # body paragraphs would render with no separation. Give each a small
+        # space-after so authored paragraph breaks read as breaks.
+        p.paragraph_format.space_after = Pt(8)
         render_runs(p, text)
 
     def add_blockquote(self, text):
@@ -404,11 +435,6 @@ class ItqRenderer:
             out = os.path.join(self.asset_dir, f'mermaid-{self._mermaid_seq}.png')
             try:
                 render_mermaid(text, out)
-                caption = self.d.add_paragraph()
-                cr = caption.add_run('Decision flowchart (rendered via kroki.io)')
-                cr.italic = True
-                cr.font.size = Pt(9)
-                cr.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
                 self.d.add_picture(out, width=Inches(6.2))
                 return
             except Exception as e:
@@ -547,8 +573,37 @@ def _patch_core_xml(raw_bytes, title, creator, subject=None):
     return xml.encode('utf-8')
 
 
+_CUSTOM_STAMP_RE = re.compile(
+    r'<property\b[^>]*\bname="ITQRendererVersion".*?</property>', re.DOTALL)
+_CUSTOM_PID_RE = re.compile(r'\bpid="(\d+)"')
+
+
+def _patch_docprops_custom(raw_bytes):
+    """Record which renderer build produced this file as a custom document
+    property.
+
+    Word preserves custom properties across save and PDF export, unlike
+    cp:lastModifiedBy, which it overwrites with the current user -- so this is
+    the only stamp that survives the finalize pass and reaches shipped output.
+    Lets a stale bundled copy be identified from the artifact alone.
+    """
+    xml = raw_bytes.decode('utf-8')
+    xml = _CUSTOM_STAMP_RE.sub('', xml)
+    pids = [int(p) for p in _CUSTOM_PID_RE.findall(xml)]
+    pid = max(pids) + 1 if pids else 2
+    prop = (
+        '<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" '
+        'pid="%d" name="ITQRendererVersion"><vt:lpwstr>%s</vt:lpwstr></property>'
+        % (pid, _xml_escape('itq-word-render ' + __version__))
+    )
+    if '</Properties>' in xml:
+        xml = xml.replace('</Properties>', prop + '</Properties>', 1)
+    return xml.encode('utf-8')
+
+
 _SDT_RE = re.compile(r'<w:sdt>(.*?)</w:sdt>', re.DOTALL)
 _ALIAS_RE = re.compile(r'<w:alias[^>]*w:val="([^"]*)"')
+_TAG_RE = re.compile(r'<w:tag[^>]*w:val="([^"]*)"')
 _XPATH_RE = re.compile(r'<w:dataBinding[^>]*w:xpath="([^"]*)"')
 _SHOWINGPLC_RE = re.compile(r'<w:showingPlcHdr\s*/>')
 _SDT_CONTENT_OPEN_RE = re.compile(r'<w:sdtContent>')
@@ -557,6 +612,11 @@ _WT_RE = re.compile(r'<w:t(\s[^>]*)?>([^<]*)</w:t>', re.DOTALL)
 
 def _identify_sdt(inner, keys):
     """Return the matcher key for this SDT, or None."""
+    # A <w:tag> is the most intentional handle (set deliberately in the
+    # template), so it wins over alias/data-binding.
+    tag = _TAG_RE.search(inner)
+    if tag and tag.group(1) in keys:
+        return tag.group(1)
     alias = _ALIAS_RE.search(inner)
     if alias and alias.group(1) in keys:
         return alias.group(1)
@@ -567,6 +627,9 @@ def _identify_sdt(inner, keys):
             if path.endswith(f':{key}[1]') or path.endswith(f':{key}'):
                 return key
     return None
+
+
+_PLACEHOLDER_RSTYLE_RE = re.compile(r'<w:rStyle[^>]*w:val="PlaceholderText"[^>]*/>')
 
 
 def _rewrite_sdt(inner, value):
@@ -582,6 +645,9 @@ def _rewrite_sdt(inner, value):
         return inner
     content_start = m.end()
     content = inner[content_start:]
+    # Strip Word's grey placeholder run style, otherwise the injected value
+    # ships looking like un-filled template text.
+    content = _PLACEHOLDER_RSTYLE_RE.sub('', content)
     # Replace the FIRST w:t's text, blank all subsequent ones
     seen = {'hit': False}
 
@@ -634,6 +700,24 @@ def _patch_document_xml(raw_bytes, field_values):
     return xml.encode('utf-8')
 
 
+_UPDATEFIELDS_RE = re.compile(r'<w:updateFields\b[^>]*/>')
+_SETTINGS_OPEN_RE = re.compile(r'(<w:settings\b[^>]*>)')
+
+
+def _patch_settings_xml(raw_bytes):
+    """Ensure <w:updateFields w:val="true"/> is present so Word recomputes the
+    TOC (and other fields) the first time the document is opened — otherwise a
+    template TOC field renders stale ('Error! Bookmark not defined.')."""
+    xml = raw_bytes.decode('utf-8')
+    if _UPDATEFIELDS_RE.search(xml):
+        return raw_bytes  # already set
+    # w:updateFields is valid as the first child of w:settings; Word accepts it
+    # immediately after the opening tag regardless of strict schema ordering.
+    new_xml, n = _SETTINGS_OPEN_RE.subn(
+        r'\1<w:updateFields w:val="true"/>', xml, count=1)
+    return new_xml.encode('utf-8') if n else raw_bytes
+
+
 def postprocess_docx(path, meta):
     """Patch the saved docx in place to populate SDTs and strip emojis."""
     sdt_values = {
@@ -647,6 +731,10 @@ def postprocess_docx(path, meta):
         'creator':     meta['author'],
         'Auteur':      meta['author'],        # alias
     }
+    # Management-summary control: filled only when --summary is supplied.
+    # Targeted by the template tag 'ManagementSummary'.
+    if meta.get('summary'):
+        sdt_values['ManagementSummary'] = meta['summary']
 
     tmp = path + '.tmp'
     with zipfile.ZipFile(path, 'r') as zin, zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
@@ -671,6 +759,10 @@ def postprocess_docx(path, meta):
                           'word/header1.xml', 'word/header2.xml',
                           'word/header3.xml'):
                 data = _patch_document_xml(data, sdt_values)
+            elif name == 'word/settings.xml':
+                data = _patch_settings_xml(data)
+            elif name == 'docProps/custom.xml':
+                data = _patch_docprops_custom(data)
             zout.writestr(item, data)
     shutil.move(tmp, path)
 
@@ -683,13 +775,20 @@ def render(template, source_md, out_path, meta):
     r.fill_version_history(meta['version_history'])
     r.clear_template_demo()
 
+    # Markdown heading level -> Word heading level. Default offset 0 means
+    # standard markdown (# -> Heading 1, ## -> Heading 2, ### -> Heading 3).
+    # Pass offset -1 for Notion-export markdown, where the page title is a
+    # single leading `#` and real sections start at `##` (reproduces the old
+    # behaviour: ## -> Heading 1).
+    offset = meta.get('heading_offset', 0)
+
     # Document title as first Heading 1
-    r.add_heading(2, meta['title_cover'])
+    r.add_heading(1, meta['title_cover'])
 
     blocks = parse_blocks(source_md)
     for b in blocks:
         if b.kind == 'heading':
-            r.add_heading(b.level, b.text)
+            r.add_heading(max(1, b.level + offset), b.text)
         elif b.kind == 'paragraph':
             r.add_paragraph(b.text)
         elif b.kind == 'ulist':
@@ -742,6 +841,14 @@ def _build_cli():
                    help='Author — appears in cover metadata block and core properties')
     p.add_argument('--version', default='1.0',
                    help='Version label — appears in cover metadata block')
+    p.add_argument('--heading-offset', type=int, default=0,
+                   help='Shift markdown heading levels onto Word heading levels. '
+                        '0 (default) = standard markdown (# -> Heading 1). '
+                        '-1 = Notion-export markdown (## -> Heading 1).')
+    p.add_argument('--summary', default=None,
+                   help='Management-summary text, OR a path to a .md/.txt file '
+                        'whose contents become the summary. Fills the template '
+                        "control tagged 'ManagementSummary'. Omit to leave blank.")
     p.add_argument('--version-history', action='append', default=None,
                    metavar='VER|DATE|AUTHOR|CHANGES',
                    help='Version history row, pipe-separated. Repeat for '
@@ -770,6 +877,12 @@ if __name__ == '__main__':
     with open(args.source, 'r', encoding='utf-8') as f:
         md = f.read()
 
+    # --summary accepts inline text or a path to a .md/.txt file.
+    summary = args.summary
+    if summary and os.path.isfile(summary):
+        with open(summary, 'r', encoding='utf-8') as f:
+            summary = f.read().strip()
+
     meta = {
         'title_cover':     args.title,
         'subtitle':        args.subtitle,
@@ -777,9 +890,11 @@ if __name__ == '__main__':
         'project':         args.project,
         'author':          args.author,
         'version':         args.version,
+        'summary':         summary,
         'version_history': _parse_history(args.version_history),
+        'heading_offset':  args.heading_offset,
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or '.', exist_ok=True)
     render(args.template, md, args.out, meta)
-    print(f'wrote {args.out}')
+    print(f'wrote {args.out}  [itq-word-render {__version__}]')

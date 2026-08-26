@@ -136,10 +136,49 @@ itq-word-plugin/
 ├── README.md                          This file
 ├── requirements.txt                   python-docx
 ├── md_to_itq_docx.py                  The converter (single file)
+├── finalize.py                        TOC bake + PDF export (needs Word)
 ├── .gitignore
 └── templates/
     └── ITQ - Word document Template.docx
 ```
+
+> **This folder is generated.** Both scripts and the template are copied
+> byte-for-byte from the canonical repo, `Casenl/markdown-to-itq-word`. Fix bugs
+> there and regenerate; edits made here are overwritten on the next build.
+
+---
+
+## Finishing the document: table of contents and PDF
+
+The converter has no layout engine, so the table of contents ships as an
+un-evaluated Word field — page numbers are blank until Word resolves it. Two ways
+to finish the job:
+
+**Just open it in Word.** The converter sets `updateFields`, so Word rebuilds the
+table of contents the first time a human opens the `.docx`. For a document you are
+handing to a person, that is enough — you need do nothing.
+
+**Or bake it and export a PDF**, which is required if you are shipping a PDF rather
+than a `.docx`:
+
+```bash
+python finalize.py --docx doc.docx --pdf doc.pdf
+```
+
+This drives Word directly (COM on Windows, AppleScript on macOS). Exit codes:
+`0` done · `2` no Word on this machine, so the `.docx` was left to self-heal ·
+`1` Word was there but the automation failed. Omit `--pdf` to bake the TOC only.
+
+⚠️ **Fonts are not embedded in the template.** The `.docx` is safe to send anywhere
+(the recipient's Word supplies Titillium, or falls back to Calibri), but a PDF is
+only as branded as the machine that exported it. Export on a machine without
+Titillium installed and the PDF silently comes out in Calibri, with no warning.
+Install the ITQ fonts before exporting a customer-facing PDF, and check the result.
+
+**Which build made this file?** Every rendered `.docx` records its renderer version
+as the custom document property `ITQRendererVersion` (File → Info → Properties, or
+read `docProps/custom.xml`). If a document renders wrongly and that version is
+behind the canonical repo, this copy is stale — pull before debugging further.
 
 ---
 
@@ -218,6 +257,11 @@ Kroki is a free public service; if your organisation blocks it, you can self-hos
 | `ValueError: assigned style is type LIST (4), need type PARAGRAPH (1)` | You're trying to pass `ITQ Bullets` as a paragraph style. It's a *list* style — the converter already handles this by applying the numId directly. Don't rename `ITQBullets` / `ITQNumbering` in the template. |
 | `PermissionError: [Errno 13]` on save | The output `.docx` is open in Word. Close it and rerun, or use a different `--out` path. |
 | Tables render as plain text | Your markdown uses GitHub-style pipe tables. Not supported yet — either convert to `<table>` / `<tr>` / `<td>` blocks, or ask for pipe-table support to be added. |
+| Table of contents has no page numbers | Expected until Word resolves the field. Open the `.docx` in Word, or run `finalize.py`. |
+| Management summary looks grey and italic, like unfilled template text | Stale copy: Word's `PlaceholderText` style was not stripped from the filled control. Check `ITQRendererVersion` in the document properties and pull the current version. |
+| Paragraphs run together, headings numbered twice, or version history says "0.9 Draft" | Stale copy predating the 2026-06 fixes. Check `ITQRendererVersion` and pull. |
+| Exported PDF is in Calibri, not Titillium | The exporting machine does not have the ITQ fonts installed. Fonts are not embedded in the template; install Titillium and re-export. |
+| `finalize.py` exits 2 | Microsoft Word is not installed here. Not an error: the `.docx` is valid and rebuilds its own TOC when opened in Word. Do not ship a PDF from this machine. |
 
 ---
 

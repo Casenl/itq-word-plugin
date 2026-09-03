@@ -15,11 +15,12 @@ Handles:
   1. numbered items  (ITQ Numbering via numId 18)
   <callout icon="..." color="..."> ... </callout>         Notion-enhanced only
   <table [header-row="true"]> <tr><td>..</td>..</tr> ... </table>  Notion-enhanced
+  | GitHub-style | pipe tables |      first row = header; backslash-pipe escapes a pipe
   ``` fenced code blocks ```          (mermaid rendered via kroki.io)
   > blockquote
   --- horizontal rule
 
-Not yet supported: GitHub-style pipe tables, inline [links](url), ![images].
+Not yet supported: inline [links](url), ![images].
 
 After python-docx saves, a post-processing pass patches the zip to:
   - populate the cover-page SDT content controls (Client/Project/Subtitle/
@@ -49,7 +50,7 @@ from docx.shared import Pt, RGBColor, Cm, Emu, Inches
 # by a stale bundled copy is diagnosable from the file itself: it is written
 # into docProps/custom.xml as the ITQRendererVersion custom property, which
 # Word preserves across save and PDF export.
-__version__ = '1.2.0'
+__version__ = '1.3.0'
 
 
 # ---------- Emoji stripping ---------------------------------------------------
@@ -111,6 +112,50 @@ def _split_table(raw):
     return rows
 
 
+# GitHub-flavoured pipe tables. The delimiter row (---, :---, ---:, :---:)
+# marks the line above as the header. A leading/trailing pipe is optional;
+# an escaped pipe (\|) stays inside its cell and is unescaped by unescape_md
+# at render time, so it needs no special handling here.
+_PIPE_SEP_RE = re.compile(r'^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$')
+_PIPE_SPLIT_RE = re.compile(r'(?<!\\)\|')
+
+
+def _split_pipe_row(line):
+    s = line.strip()
+    if s.startswith('|'):
+        s = s[1:]
+    if s.endswith('|') and not s.endswith('\\|'):
+        s = s[:-1]
+    return [c.strip() for c in _PIPE_SPLIT_RE.split(s)]
+
+
+def _has_pipe(line):
+    return bool(_PIPE_SPLIT_RE.search(line))
+
+
+_BLOCK_START_RE = re.compile(r'^(#{1,6}\s|[-*]\s|\d+\.\s|>|```|---\s*$|<callout|<table)')
+
+
+def _is_block_start(stripped):
+    """True when a line opens another block-level construct, which ends a
+    pipe table even if the line itself happens to contain a pipe."""
+    return bool(_BLOCK_START_RE.match(stripped))
+
+
+def _is_pipe_table_start(lines, i):
+    # Header row must contain an unescaped pipe, and the delimiter row must
+    # contain BOTH a dash run and a pipe, so a bare '---' rule after a prose
+    # line that happens to contain '|' is never mistaken for a table.
+    if not _has_pipe(lines[i]) or i + 1 >= len(lines):
+        return False
+    nxt = lines[i + 1].strip()
+    if not ('|' in nxt and '-' in nxt and _PIPE_SEP_RE.match(nxt)):
+        return False
+    # GFM: the delimiter row must have exactly as many cells as the header,
+    # otherwise the lines are ordinary paragraphs.
+    return len(_split_pipe_row(nxt)) == len(_split_pipe_row(lines[i]))
+
+
 def parse_blocks(text):
     lines = text.splitlines()
     i, n = 0, len(lines)
@@ -161,6 +206,24 @@ def parse_blocks(text):
             rows = _split_table('\n'.join(buf))
             if rows:
                 blocks.append(Block('table', header=header_row, rows=rows))
+            continue
+
+        if _is_pipe_table_start(lines, i):
+            header = _split_pipe_row(lines[i])
+            width = len(header)
+            rows = [header]
+            i += 2  # skip the header row and the one syntactic delimiter row
+            while i < n:
+                s = lines[i].strip()
+                if not s or not _has_pipe(s) or _is_block_start(s):
+                    break
+                cells = _split_pipe_row(s)
+                # GFM: table width is fixed by the header; excess cells are
+                # ignored, missing cells are padded.
+                cells = (cells + [''] * width)[:width]
+                rows.append(cells)
+                i += 1
+            blocks.append(Block('table', header=True, rows=rows))
             continue
 
         m = re.match(r'^(#{1,6})\s+(.*)$', stripped)

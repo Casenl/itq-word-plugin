@@ -50,7 +50,7 @@ from docx.shared import Pt, RGBColor, Cm, Emu, Inches
 # by a stale bundled copy is diagnosable from the file itself: it is written
 # into docProps/custom.xml as the ITQRendererVersion custom property, which
 # Word preserves across save and PDF export.
-__version__ = '1.3.0'
+__version__ = '1.3.1'
 
 
 # ---------- Emoji stripping ---------------------------------------------------
@@ -725,7 +725,49 @@ def _rewrite_sdt(inner, value):
         return f'<w:t{attrs}></w:t>'
 
     content = _WT_RE.sub(repl, content)
+    content = _inherit_sdt_run_props(inner[:content_start], content)
     return inner[:content_start] + content
+
+
+_SDTPR_RPR_RE = re.compile(r'<w:sdtPr>\s*(<w:rPr>.*?</w:rPr>)', re.DOTALL)
+_RUN_OPEN_RE = re.compile(r'<w:r(?:\s[^>]*)?>')
+
+
+def _inherit_sdt_run_props(sdt_head, content):
+    """Give the run that carries the injected value the control's own run
+    properties when it has none of its own.
+
+    Word applies <w:sdtPr><w:rPr> to placeholder text only. Once a real run
+    sits in sdtContent without an <w:rPr>, it inherits the paragraph style
+    instead, which on the dark cover page turns the Client value Royal Blue
+    on Royal Blue (invisible) while Author/Date, whose template runs carry an
+    explicit white <w:rPr>, render fine. Copying the sdtPr rPr onto a bare run
+    restores what the template author intended."""
+    props = _SDTPR_RPR_RE.search(sdt_head)
+    if not props:
+        return content
+    t_pos = content.find('<w:t')
+    if t_pos < 0:
+        return content
+    run_open = None
+    for m in _RUN_OPEN_RE.finditer(content, 0, t_pos):
+        run_open = m
+    if run_open is None:
+        return content
+    between = content[run_open.end():t_pos]
+    # An rPr left empty after the PlaceholderText style was stripped counts
+    # as absent: Word drops it on save and the run falls back to the paragraph.
+    empty = _EMPTY_RPR_RE.search(between)
+    if empty:
+        start = run_open.end() + empty.start()
+        end = run_open.end() + empty.end()
+        return content[:start] + props.group(1) + content[end:]
+    if '<w:rPr>' in between or '<w:rPr ' in between:
+        return content
+    return content[:run_open.end()] + props.group(1) + content[run_open.end():]
+
+
+_EMPTY_RPR_RE = re.compile(r'<w:rPr>\s*</w:rPr>|<w:rPr\s*/>')
 
 
 def _patch_document_xml(raw_bytes, field_values):

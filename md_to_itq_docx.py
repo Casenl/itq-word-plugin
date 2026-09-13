@@ -19,8 +19,15 @@ Handles:
   ``` fenced code blocks ```          (mermaid rendered via kroki.io)
   > blockquote
   --- horizontal rule
+  ![Caption](path.png)                 a paragraph that is ONLY an image: centred
+                                       picture (max 6.2in wide, natural width if
+                                       smaller at 96 dpi), alt text as caption.
+                                       png/jpg/jpeg; path relative to the .md
+                                       file (fallback: cwd). Missing files warn
+                                       and leave a "[Figure missing: ...]" note.
 
-Not yet supported: inline [links](url), ![images].
+Not yet supported: inline [links](url); images INSIDE a text paragraph are
+dropped with a warning (file:line) rather than rendered.
 
 After python-docx saves, a post-processing pass patches the zip to:
   - populate the cover-page SDT content controls (Client/Project/Subtitle/
@@ -35,12 +42,15 @@ import os
 import re
 import sys
 import shutil
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from copy import deepcopy
 
 from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.image.image import Image as DocxImage
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Cm, Emu, Inches
@@ -50,7 +60,13 @@ from docx.shared import Pt, RGBColor, Cm, Emu, Inches
 # by a stale bundled copy is diagnosable from the file itself: it is written
 # into docProps/custom.xml as the ITQRendererVersion custom property, which
 # Word preserves across save and PDF export.
-__version__ = '1.3.1'
+__version__ = '1.5.0'
+
+
+def warn(msg):
+    """Non-fatal diagnostics go to stderr so the render still completes and
+    stdout keeps carrying only the 'wrote ...' line."""
+    print('warning: ' + msg, file=sys.stderr)
 
 
 # ---------- Emoji stripping ---------------------------------------------------
@@ -156,7 +172,160 @@ def _is_pipe_table_start(lines, i):
     return len(_split_pipe_row(nxt)) == len(_split_pipe_row(lines[i]))
 
 
-def parse_blocks(text):
+# Images. A paragraph consisting of nothing but `![alt](target)` becomes an
+# image block; an image embedded in running text is dropped (with a warning)
+# because inline pictures have no sensible layout in the house template. A
+# backslash-escaped `\![` is Notion's way of saying "literal text" and is left
+# for unescape_md; image syntax quoted inside an inline-code span is code.
+_CODE_SPAN_RE = re.compile(r'`[^`\n]+`')
+# `<path with spaces>` or `path "optional title"`; CommonMark also allows a
+# title in single quotes or parentheses: `path (title)`.
+_IMAGE_TARGET_RE = re.compile(r'^(?:<([^>]*)>|(\S+))(?:\s+("[^"]*"|\'[^\']*\'|\([^)]*\)))?$')
+
+
+def _scan_balanced(text, start, open_ch, close_ch):
+    """Index of the bracket closing the one at `start`, honouring nesting
+    and backslash-escaped brackets (e.g. alt text `![a \\] b](x.png)`
+    keeps its escaped `]` from ending the label early); -1 when
+    unterminated."""
+    depth = 0
+    k = start
+    n = len(text)
+    while k < n:
+        c = text[k]
+        if c == '\\' and k + 1 < n:
+            k += 2
+            continue
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return -1
+
+
+def _scan_image_dest_close(text, start):
+    """Index of the ')' closing the destination/title group opened by the
+    '(' at `start` (as `_scan_balanced` does for '(' / ')'), but also
+    honouring the inline-link syntax that can legally appear inside that
+    group: a backslash escape (`\\)`), an angle-bracketed destination
+    (`<a).b>`), and a quoted title (`"a)b"` / `'a)b'`) can all contain a
+    literal ')' that must NOT be mistaken for the group's own close --
+    unlike plain nested parens (`run(1).png`), which still need counting.
+    -1 when unterminated."""
+    depth = 0
+    i = start
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '\\' and i + 1 < n:
+            i += 2
+            continue
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+        elif c == '<':
+            end = text.find('>', i + 1)
+            if end >= 0:
+                i = end + 1
+                continue
+        elif c in ('"', "'") and text[i - 1] in (' ', '\t'):
+            # Markdown only permits a title after whitespace following the
+            # destination, so a quote/apostrophe anywhere else (e.g. inside
+            # an unquoted destination like "user's.png") is just a literal
+            # character, not the start of a quoted span to jump over.
+            end = text.find(c, i + 1)
+            if end >= 0:
+                i = end + 1
+                continue
+        i += 1
+    return -1
+
+
+def find_image_tokens(text):
+    r"""Every `![alt](dest)` in `text` as (start, end, alt, dest).
+
+    Alt text may contain balanced square brackets ("See [R-57]"), the
+    destination balanced parentheses ("run(1).png"). Escaped `\![` and
+    anything inside an inline-code span are skipped."""
+    tokens = []
+    code_spans = [(m.start(), m.end()) for m in _CODE_SPAN_RE.finditer(text)]
+    i = 0
+    while True:
+        i = text.find('![', i)
+        if i < 0:
+            break
+        if (i > 0 and text[i - 1] == '\\') or any(a <= i < b for a, b in code_spans):
+            i += 2
+            continue
+        j = _scan_balanced(text, i + 1, '[', ']')
+        if j < 0 or j + 1 >= len(text) or text[j + 1] != '(':
+            i += 2
+            continue
+        k = _scan_image_dest_close(text, j + 1)
+        if k < 0:
+            i += 2
+            continue
+        tokens.append((i, k + 1, text[i + 2:j], text[j + 2:k]))
+        i = k + 1
+    return tokens
+
+
+def _whole_line_image(stripped):
+    """(alt, dest) when the line is exactly one image token, else None."""
+    if not stripped.startswith('!['):
+        return None
+    toks = find_image_tokens(stripped)
+    if len(toks) != 1:
+        return None
+    start, end, alt, dest = toks[0]
+    if start != 0 or end != len(stripped) or not dest.strip():
+        return None
+    return alt, dest
+
+
+_MD_ESCAPE_RE = re.compile(r'\\([!"#$%&\'()*+,\-./:;<=>?@\[\\\]^_`{|}~])')
+
+
+def _unescape_md(text):
+    """Drop the backslash from CommonMark escapes (backslash + ASCII
+    punctuation). The scanner keeps the escape so `plot\\).png` is not cut
+    at the `)`; the filesystem lookup needs the literal `plot).png`."""
+    return _MD_ESCAPE_RE.sub(r'\1', text)
+
+
+def _parse_image_target(raw):
+    raw = raw.strip()
+    m = _IMAGE_TARGET_RE.match(raw)
+    if not m:
+        return _unescape_md(raw)  # e.g. an unbracketed path with spaces and no title
+    return _unescape_md(m.group(1) if m.group(1) is not None else m.group(2))
+
+
+def _drop_inline_images(text, lineno, source_name):
+    """Remove `![..](..)` occurrences from running text, warning per image."""
+    if '![' not in text:
+        return text
+    toks = find_image_tokens(text)
+    if not toks:
+        return text
+    out = []
+    pos = 0
+    for start, end, _alt, _dest in toks:
+        warn('%s:%d: inline image dropped (only whole-paragraph images render): %s'
+             % (source_name, lineno, text[start:end]))
+        out.append(text[pos:start])
+        pos = end
+    out.append(text[pos:])
+    return re.sub(r'[ \t]{2,}', ' ', ''.join(out)).strip()
+
+
+def parse_blocks(text, source_name='<markdown>'):
     lines = text.splitlines()
     i, n = 0, len(lines)
     blocks = []
@@ -229,14 +398,16 @@ def parse_blocks(text):
         m = re.match(r'^(#{1,6})\s+(.*)$', stripped)
         if m:
             blocks.append(Block('heading', level=len(m.group(1)),
-                                text=m.group(2).strip()))
+                                text=_drop_inline_images(
+                                    m.group(2).strip(), i + 1, source_name)))
             i += 1
             continue
 
         if stripped.startswith('>'):
             buf = []
             while i < n and lines[i].strip().startswith('>'):
-                buf.append(lines[i].strip().lstrip('>').lstrip())
+                buf.append(_drop_inline_images(
+                    lines[i].strip().lstrip('>').lstrip(), i + 1, source_name))
                 i += 1
             blocks.append(Block('blockquote', text='\n'.join(buf).strip()))
             continue
@@ -247,7 +418,7 @@ def parse_blocks(text):
             while i < n:
                 mm = re.match(r'^(\d+)\.\s+(.*)$', lines[i].strip())
                 if not mm: break
-                items.append(mm.group(2))
+                items.append(_drop_inline_images(mm.group(2), i + 1, source_name))
                 i += 1
             blocks.append(Block('olist', items=items))
             continue
@@ -257,15 +428,25 @@ def parse_blocks(text):
             while i < n:
                 s = lines[i].strip()
                 if s.startswith('- ') or s.startswith('* '):
-                    items.append(s[2:]); i += 1
+                    items.append(_drop_inline_images(s[2:], i + 1, source_name)); i += 1
                 else:
                     break
             blocks.append(Block('ulist', items=items))
             continue
 
+        img = _whole_line_image(stripped)
+        if img:
+            blocks.append(Block('image', alt=img[0].strip(),
+                                target=_parse_image_target(img[1]),
+                                line=i + 1))
+            i += 1
+            continue
+
         # Paragraph: in Notion-flavoured markdown each non-empty line is its
         # own logical paragraph (no soft-wrapping), so emit one block per line.
-        blocks.append(Block('paragraph', text=stripped))
+        para = _drop_inline_images(stripped, i + 1, source_name)
+        if para:
+            blocks.append(Block('paragraph', text=para))
         i += 1
 
     return blocks
@@ -375,10 +556,45 @@ def render_mermaid(source, out_path):
 
 # ---------- Renderer ----------------------------------------------------------
 
+IMAGE_MAX_WIDTH_IN = 6.2      # matches the mermaid figure width
+IMAGE_SCREEN_DPI = 96.0       # "natural size" of a screenshot / exported PNG
+IMAGE_FORMATS = ('.png', '.jpg', '.jpeg')
+ITQ_ROYAL_BLUE = RGBColor(0x04, 0x05, 0x5A)
+
+
+def resolve_image_path(target, source_dir=None):
+    """Turn a markdown image target into a filesystem path.
+
+    Relative targets resolve against the markdown file's directory first and
+    the current working directory second. A URL-encoded form (Notion exports
+    write `Screen%20Shot.png`) is tried as a fallback. Returns the first
+    candidate that exists, else the primary candidate (for the message).
+    """
+    variants = [target]
+    unquoted = urllib.parse.unquote(target)
+    if unquoted != target:
+        variants.append(unquoted)
+    if os.path.isabs(target):
+        bases = [None]
+    else:
+        bases = ([source_dir] if source_dir else []) + [os.getcwd()]
+    candidates = []
+    for base in bases:
+        for v in variants:
+            candidates.append(v if base is None else os.path.join(base, v))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return candidates[0]
+
+
 class ItqRenderer:
-    def __init__(self, template_path, asset_dir):
+    def __init__(self, template_path, asset_dir, source_dir=None,
+                 source_name='<markdown>'):
         self.d = Document(template_path)
         self.asset_dir = asset_dir
+        self.source_dir = source_dir
+        self.source_name = source_name
         os.makedirs(asset_dir, exist_ok=True)
         self._mermaid_seq = 0
         self._discover_list_numids()
@@ -519,6 +735,79 @@ class ItqRenderer:
             pPr.append(shd)
             r = p.add_run(line if line else ' ')
             r.font.name = 'Consolas'; r.font.size = Pt(9)
+
+    # --- images --------------------------------------------------------------
+
+    def _add_figure_note(self, text):
+        p = self.d.add_paragraph()
+        p.paragraph_format.space_after = Pt(8)
+        r = p.add_run(text)
+        r.italic = True
+        return p
+
+    def _add_caption(self, alt):
+        # The template ships a 'Caption' style (9pt, ITQ accent colour, spacing
+        # before/after); reuse it so captions match anything the author adds
+        # by hand in Word. Fall back to an explicit small italic Royal Blue.
+        has_style = 'Caption' in [s.name for s in self.d.styles]
+        p = self.d.add_paragraph(style='Caption' if has_style else None)
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        render_runs(p, alt)
+        if not has_style:
+            p.paragraph_format.space_after = Pt(8)
+            for r in p.runs:
+                r.italic = True
+                r.font.size = Pt(9)
+                r.font.color.rgb = ITQ_ROYAL_BLUE
+        return p
+
+    def add_image(self, alt, target, line=None):
+        """Centred picture, at most IMAGE_MAX_WIDTH_IN wide (natural width at
+        96 dpi if smaller), aspect ratio kept, alt text as caption underneath.
+        Never raises: every failure warns and leaves an italic note in place."""
+        where = '%s:%s' % (self.source_name, line if line is not None else '?')
+        # Remote images are never fetched. That includes protocol-relative
+        # (`//host/x.png`) and UNC (`\\host\share\x.png`) targets, which
+        # os.path.isfile() would otherwise probe over SMB on Windows.
+        if (re.match(r'^[a-z][a-z0-9+.-]*://', target, re.IGNORECASE)
+                or target.startswith(('//', '\\\\'))):
+            warn('%s: remote images are not downloaded, skipped: %s' % (where, target))
+            self._add_figure_note('[Figure missing: %s]' % target)
+            return
+        path = resolve_image_path(target, self.source_dir)
+        if not os.path.isfile(path):
+            warn('%s: image file not found, skipped: %s (looked for %s)'
+                 % (where, target, path))
+            self._add_figure_note('[Figure missing: %s]' % target)
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in IMAGE_FORMATS:
+            warn('%s: unsupported image format %s, skipped: %s (supported: %s)'
+                 % (where, ext or '(none)', target, ', '.join(IMAGE_FORMATS)))
+            self._add_figure_note('[Figure missing: %s]' % target)
+            return
+        p = None
+        try:
+            px_width = DocxImage.from_file(path).px_width
+            natural = Inches(px_width / IMAGE_SCREEN_DPI)
+            width = min(Inches(IMAGE_MAX_WIDTH_IN), natural)
+            p = self.d.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.keep_with_next = True
+            p.add_run().add_picture(path, width=width)
+        except Exception as e:  # corrupt file, unreadable header, ...
+            # Remove only the paragraph THIS call created (add_picture can
+            # fail after it exists), never whatever preceded the figure.
+            if p is not None:
+                p._p.getparent().remove(p._p)
+            warn('%s: could not embed image %s: %s' % (where, target, e))
+            self._add_figure_note('[Figure missing: %s]' % target)
+            return
+        if alt:
+            self._add_caption(alt)
+        else:
+            p.paragraph_format.keep_with_next = False
+            p.paragraph_format.space_after = Pt(8)
 
     def add_callout(self, icon, color, text):
         t = self.d.add_table(rows=1, cols=1)
@@ -823,6 +1112,85 @@ def _patch_settings_xml(raw_bytes):
     return new_xml.encode('utf-8') if n else raw_bytes
 
 
+_PARA_PPR_RE = re.compile(r'<w:pPr>.*?</w:pPr>', re.DOTALL)
+_RPR_BLOCK_RE = re.compile(r'<w:rPr>.*?</w:rPr>', re.DOTALL)
+
+# Marks the data-binding xpath of the cover/title-page "Version" row, which
+# every metadata block in the template carries (the dark cover text box and
+# the light title page both bind ProjectName/ClientName/Version the same
+# way). Anchoring on this rather than a fixed paragraph index lets a new
+# Classification row be added next to Version wherever that block appears,
+# without needing a dedicated content control for it in the template.
+_VERSION_XPATH_MARK = 'ns0:Version[1]'
+
+
+def _insert_cover_classification_rows(raw_bytes, classification):
+    """Add a 'Classification' row directly after every cover/title-page
+    'Version' row, reusing that row's own paragraph and run formatting so
+    the new row automatically matches white-on-dark or Royal-Blue/black-on-
+    light, whichever the surrounding block already uses. No-op (byte-
+    identical passthrough) when classification is empty."""
+    if not classification:
+        return raw_bytes
+    xml = raw_bytes.decode('utf-8')
+    escaped = _xml_escape(strip_emoji(classification, trim=True))
+    inserts = []  # (insert_pos, new_paragraph_xml)
+    search_from = 0
+    while True:
+        idx = xml.find(_VERSION_XPATH_MARK, search_from)
+        if idx < 0:
+            break
+        start = max(xml.rfind('<w:p>', 0, idx), xml.rfind('<w:p ', 0, idx))
+        end = xml.find('</w:p>', idx)
+        if start < 0 or end < 0:
+            search_from = idx + len(_VERSION_XPATH_MARK)
+            continue
+        end_full = end + len('</w:p>')
+        para = xml[start:end_full]
+        ppr_m = _PARA_PPR_RE.search(para)
+        rprs = _RPR_BLOCK_RE.findall(para[ppr_m.end():]) if ppr_m else []
+        if not ppr_m or len(rprs) < 2:
+            # Unexpected structure (template changed) — skip rather than
+            # emit a malformed paragraph.
+            search_from = end_full
+            continue
+        bold_rpr, plain_rpr = rprs[0], rprs[1]  # label style, value style
+        new_para = (
+            '<w:p>' + ppr_m.group(0)
+            + '<w:r>' + bold_rpr + '<w:t xml:space="preserve">Classification</w:t></w:r>'
+            + '<w:r>' + plain_rpr + '<w:tab/></w:r>'
+            + '<w:r>' + plain_rpr + '<w:t xml:space="preserve">' + escaped + '</w:t></w:r>'
+            + '</w:p>'
+        )
+        inserts.append((end_full, new_para))
+        search_from = end_full
+    for pos, new_para in reversed(inserts):
+        xml = xml[:pos] + new_para + xml[pos:]
+    return xml.encode('utf-8')
+
+
+def _append_footer_classification(raw_bytes, classification):
+    """Append ' | CLASSIFICATION' to the end of the footer's page-number
+    line, reusing the run formatting already used there (Titillium Web,
+    Royal Blue, 8pt) so it reads as part of the same footer text. No-op
+    (byte-identical passthrough) when classification is empty."""
+    if not classification:
+        return raw_bytes
+    xml = raw_bytes.decode('utf-8')
+    ftr_end = xml.rfind('</w:ftr>')
+    if ftr_end < 0:
+        return raw_bytes
+    p_end = xml.rfind('</w:p>', 0, ftr_end)
+    if p_end < 0:
+        return raw_bytes
+    rpr_end = xml.rfind('</w:rPr>', 0, p_end)
+    rpr_start = xml.rfind('<w:rPr>', 0, rpr_end) if rpr_end >= 0 else -1
+    rpr = xml[rpr_start:rpr_end + len('</w:rPr>')] if rpr_start >= 0 else ''
+    label = strip_emoji(classification, trim=True).upper()
+    run = '<w:r>' + rpr + '<w:t xml:space="preserve"> | ' + _xml_escape(label) + '</w:t></w:r>'
+    return (xml[:p_end] + run + xml[p_end:]).encode('utf-8')
+
+
 def postprocess_docx(path, meta):
     """Patch the saved docx in place to populate SDTs and strip emojis."""
     sdt_values = {
@@ -840,6 +1208,8 @@ def postprocess_docx(path, meta):
     # Targeted by the template tag 'ManagementSummary'.
     if meta.get('summary'):
         sdt_values['ManagementSummary'] = meta['summary']
+
+    classification = meta.get('classification') or ''
 
     tmp = path + '.tmp'
     with zipfile.ZipFile(path, 'r') as zin, zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
@@ -859,10 +1229,13 @@ def postprocess_docx(path, meta):
                     title=strip_emoji(meta['title_cover'], trim=True),
                     creator=strip_emoji(meta['author'], trim=True),
                 )
-            elif name in ('word/document.xml', 'word/footer1.xml',
-                          'word/footer2.xml', 'word/footer3.xml',
-                          'word/header1.xml', 'word/header2.xml',
-                          'word/header3.xml'):
+            elif name == 'word/document.xml':
+                data = _patch_document_xml(data, sdt_values)
+                data = _insert_cover_classification_rows(data, classification)
+            elif name in ('word/footer1.xml', 'word/footer2.xml', 'word/footer3.xml'):
+                data = _patch_document_xml(data, sdt_values)
+                data = _append_footer_classification(data, classification)
+            elif name in ('word/header1.xml', 'word/header2.xml', 'word/header3.xml'):
                 data = _patch_document_xml(data, sdt_values)
             elif name == 'word/settings.xml':
                 data = _patch_settings_xml(data)
@@ -876,7 +1249,14 @@ def postprocess_docx(path, meta):
 
 def render(template, source_md, out_path, meta):
     asset_dir = os.path.join(os.path.dirname(out_path), 'assets')
-    r = ItqRenderer(template, asset_dir)
+    # meta['source_path'] (the .md file) anchors relative image paths and
+    # names the file in warnings. Callers that pass markdown text only get
+    # cwd-relative resolution.
+    source_path = meta.get('source_path')
+    source_dir = os.path.dirname(os.path.abspath(source_path)) if source_path else None
+    source_name = source_path if source_path else '<markdown>'
+    r = ItqRenderer(template, asset_dir, source_dir=source_dir,
+                    source_name=source_name)
     r.fill_version_history(meta['version_history'])
     r.clear_template_demo()
 
@@ -890,12 +1270,14 @@ def render(template, source_md, out_path, meta):
     # Document title as first Heading 1
     r.add_heading(1, meta['title_cover'])
 
-    blocks = parse_blocks(source_md)
+    blocks = parse_blocks(source_md, source_name=source_name)
     for b in blocks:
         if b.kind == 'heading':
             r.add_heading(max(1, b.level + offset), b.text)
         elif b.kind == 'paragraph':
             r.add_paragraph(b.text)
+        elif b.kind == 'image':
+            r.add_image(b.alt, b.target, b.line)
         elif b.kind == 'ulist':
             for item in b.items: r.add_bullet(item)
         elif b.kind == 'olist':
@@ -946,6 +1328,12 @@ def _build_cli():
                    help='Author — appears in cover metadata block and core properties')
     p.add_argument('--version', default='1.0',
                    help='Version label — appears in cover metadata block')
+    p.add_argument('--classification', default='',
+                   help='Document classification (e.g. INTERNAL, CONFIDENTIAL). '
+                        'Adds a Classification row next to Client/Project/Version '
+                        'on the cover and title page, and a short uppercase label '
+                        'in the footer of every body page. Omit for no change to '
+                        'the output (default behaviour).')
     p.add_argument('--heading-offset', type=int, default=0,
                    help='Shift markdown heading levels onto Word heading levels. '
                         '0 (default) = standard markdown (# -> Heading 1). '
@@ -995,9 +1383,11 @@ if __name__ == '__main__':
         'project':         args.project,
         'author':          args.author,
         'version':         args.version,
+        'classification':  args.classification,
         'summary':         summary,
         'version_history': _parse_history(args.version_history),
         'heading_offset':  args.heading_offset,
+        'source_path':     args.source,
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or '.', exist_ok=True)

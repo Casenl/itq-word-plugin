@@ -39,6 +39,42 @@ import tempfile
 # parent maps it to this script's exit 2 (no Word) rather than 1 (failure).
 _PS_NO_WORD = 3
 
+# A sync client (Syncthing, OneDrive) scanning the freshly written .docx can
+# hold a transient lock, which Word reports as "cannot complete the save due
+# to a file permission error". One retry after a short pause clears that case;
+# a persistent error (read-only file, real ACL problem) still fails loudly.
+SAVE_ATTEMPTS = 2
+SAVE_RETRY_SECONDS = 3
+
+# Kept as a standalone function (not inlined in the template) so the retry
+# behaviour can be exercised in pwsh against a fake document object, without
+# Word. Not a .format template: no brace doubling here.
+PS_SAVE_FUNCTION = r'''
+function Save-WithRetry($doc, $attempts, $pauseSeconds) {
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        try {
+            $doc.Save()
+            return
+        } catch {
+            if ($attempt -ge $attempts) { throw }
+            [Console]::Error.WriteLine('finalize: save attempt ' + $attempt + ' failed (' + $_.Exception.Message.Trim() + '); retrying in ' + $pauseSeconds + 's')
+            Start-Sleep -Seconds $pauseSeconds
+        }
+    }
+}
+'''
+
+# Cleanup discipline: the document is closed WITHOUT saving and Word is quit
+# in `finally`, both wrapped so one failure cannot skip the other. Before this,
+# a failed Save left a dirty document open, Quit() prompted "save changes?" in
+# an invisible window, and a headless WINWORD /Automation process stayed alive
+# holding the .docx locked. DisplayAlerts=0 (wdAlertsNone) keeps every other
+# dialog from blocking too.
+#
+# Read-only guard: Save() on a document Word opened read-only (file attribute,
+# or another process holding it) does NOT raise -- it parks a Save As dialog
+# behind the invisible window and blocks forever, alerts off or not (verified
+# 2026-09-13). Refusing up front turns that hang into a clear exit 1.
 POWERSHELL_TEMPLATE = r'''
 $ErrorActionPreference = 'Stop'
 $docx = {docx}
@@ -50,15 +86,20 @@ try {{
     exit {no_word}
 }}
 $word.Visible = $false
+$word.DisplayAlerts = 0   # wdAlertsNone
+$doc = $null
 try {{
     $doc = $word.Documents.Open($docx)
+    if ($doc.ReadOnly) {{
+        throw ('document opened read-only (file attribute or another process holds it): ' + $docx)
+    }}
     foreach ($toc in $doc.TablesOfContents) {{ $toc.Update() }}
     $doc.Fields.Update() | Out-Null
-    $doc.Save()
+    Save-WithRetry $doc {save_attempts} {retry_seconds}
     if ($pdf) {{ $doc.ExportAsFixedFormat($pdf, 17) }}   # 17 = wdExportFormatPDF
-    $doc.Close()
 }} finally {{
-    $word.Quit()
+    if ($null -ne $doc) {{ try {{ $doc.Close(0) }} catch {{}} }}   # 0 = wdDoNotSaveChanges
+    try {{ $word.Quit(0) }} catch {{}}
     [System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null
 }}
 '''
@@ -126,13 +167,18 @@ def _powershell_exe():
     return shutil.which('pwsh') or shutil.which('powershell')
 
 
+def build_powershell_script(docx, pdf):
+    return PS_SAVE_FUNCTION + POWERSHELL_TEMPLATE.format(
+        docx=_ps_quote(docx), pdf=_ps_quote(pdf or ''), no_word=_PS_NO_WORD,
+        save_attempts=SAVE_ATTEMPTS, retry_seconds=SAVE_RETRY_SECONDS)
+
+
 def finalize_windows(docx, pdf):
     exe = _powershell_exe()
     if not exe:
         print('finalize: no pwsh/powershell on PATH', file=sys.stderr)
         return 1
-    script = POWERSHELL_TEMPLATE.format(
-        docx=_ps_quote(docx), pdf=_ps_quote(pdf or ''), no_word=_PS_NO_WORD)
+    script = build_powershell_script(docx, pdf)
     handle, path = tempfile.mkstemp(suffix='.ps1')
     try:
         # utf-8-sig: the BOM makes Windows PowerShell 5.1 decode the file as

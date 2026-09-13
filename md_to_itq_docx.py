@@ -60,7 +60,7 @@ from docx.shared import Pt, RGBColor, Cm, Emu, Inches
 # by a stale bundled copy is diagnosable from the file itself: it is written
 # into docProps/custom.xml as the ITQRendererVersion custom property, which
 # Word preserves across save and PDF export.
-__version__ = '1.5.0'
+__version__ = '1.5.1'
 
 
 def warn(msg):
@@ -307,22 +307,35 @@ def _parse_image_target(raw):
     return _unescape_md(m.group(1) if m.group(1) is not None else m.group(2))
 
 
-def _drop_inline_images(text, lineno, source_name):
-    """Remove `![..](..)` occurrences from running text, warning per image."""
+def _drop_inline_images(text, lineno, source_name, alt_fallback=False):
+    """Remove `![..](..)` occurrences from running text, warning per image.
+
+    With `alt_fallback`, a text that consists of nothing but images keeps
+    the images' alt text instead of becoming empty: a heading or list item
+    such as `# ![Logo](logo.png)` then reads "Logo" rather than producing an
+    empty heading (and an empty TOC entry). Callers still drop the block
+    when the result is empty."""
     if '![' not in text:
         return text
     toks = find_image_tokens(text)
     if not toks:
         return text
     out = []
+    alts = []
     pos = 0
-    for start, end, _alt, _dest in toks:
+    for start, end, alt, _dest in toks:
         warn('%s:%d: inline image dropped (only whole-paragraph images render): %s'
              % (source_name, lineno, text[start:end]))
         out.append(text[pos:start])
+        alts.append(alt.strip())
         pos = end
     out.append(text[pos:])
-    return re.sub(r'[ \t]{2,}', ' ', ''.join(out)).strip()
+    cleaned = re.sub(r'[ \t]{2,}', ' ', ''.join(out)).strip()
+    if not cleaned and alt_fallback:
+        cleaned = ' '.join(a for a in alts if a)
+        if cleaned:
+            warn('%s:%d: kept the alt text as the block text: %s' % (source_name, lineno, cleaned))
+    return cleaned
 
 
 def parse_blocks(text, source_name='<markdown>'):
@@ -397,19 +410,28 @@ def parse_blocks(text, source_name='<markdown>'):
 
         m = re.match(r'^(#{1,6})\s+(.*)$', stripped)
         if m:
-            blocks.append(Block('heading', level=len(m.group(1)),
-                                text=_drop_inline_images(
-                                    m.group(2).strip(), i + 1, source_name)))
+            text = _drop_inline_images(m.group(2).strip(), i + 1, source_name,
+                                       alt_fallback=True)
+            if text:
+                blocks.append(Block('heading', level=len(m.group(1)), text=text))
+            else:
+                warn('%s:%d: heading emptied by image removal, skipped' % (source_name, i + 1))
             i += 1
             continue
 
         if stripped.startswith('>'):
             buf = []
             while i < n and lines[i].strip().startswith('>'):
-                buf.append(_drop_inline_images(
-                    lines[i].strip().lstrip('>').lstrip(), i + 1, source_name))
+                raw = lines[i].strip().lstrip('>').lstrip()
+                cleaned = _drop_inline_images(raw, i + 1, source_name, alt_fallback=True)
+                # Drop only lines that image removal emptied; an intentional
+                # blank quoted line (`>`) keeps the paragraph break it marks.
+                if cleaned or not raw:
+                    buf.append(cleaned)
                 i += 1
-            blocks.append(Block('blockquote', text='\n'.join(buf).strip()))
+            quote = '\n'.join(buf).strip()
+            if quote:
+                blocks.append(Block('blockquote', text=quote))
             continue
 
         m = re.match(r'^(\d+)\.\s+(.*)$', stripped)
@@ -418,9 +440,12 @@ def parse_blocks(text, source_name='<markdown>'):
             while i < n:
                 mm = re.match(r'^(\d+)\.\s+(.*)$', lines[i].strip())
                 if not mm: break
-                items.append(_drop_inline_images(mm.group(2), i + 1, source_name))
+                items.append(_drop_inline_images(mm.group(2), i + 1, source_name,
+                                                 alt_fallback=True))
                 i += 1
-            blocks.append(Block('olist', items=items))
+            items = [it for it in items if it]
+            if items:
+                blocks.append(Block('olist', items=items))
             continue
 
         if stripped.startswith('- ') or stripped.startswith('* '):
@@ -428,10 +453,13 @@ def parse_blocks(text, source_name='<markdown>'):
             while i < n:
                 s = lines[i].strip()
                 if s.startswith('- ') or s.startswith('* '):
-                    items.append(_drop_inline_images(s[2:], i + 1, source_name)); i += 1
+                    items.append(_drop_inline_images(s[2:], i + 1, source_name,
+                                                     alt_fallback=True)); i += 1
                 else:
                     break
-            blocks.append(Block('ulist', items=items))
+            items = [it for it in items if it]
+            if items:
+                blocks.append(Block('ulist', items=items))
             continue
 
         img = _whole_line_image(stripped)

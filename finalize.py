@@ -88,6 +88,7 @@ try {{
 $word.Visible = $false
 $word.DisplayAlerts = 0   # wdAlertsNone
 $doc = $null
+$quitError = $null
 try {{
     $doc = $word.Documents.Open($docx)
     if ($doc.ReadOnly) {{
@@ -99,10 +100,19 @@ try {{
     if ($pdf) {{ $doc.ExportAsFixedFormat($pdf, 17) }}   # 17 = wdExportFormatPDF
 }} finally {{
     if ($null -ne $doc) {{ try {{ $doc.Close(0) }} catch {{}} }}   # 0 = wdDoNotSaveChanges
-    try {{ $word.Quit(0) }} catch {{}}
+    try {{ $word.Quit(0) }} catch {{ $quitError = $_.Exception.Message }}
     [System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null
 }}
+# A Quit() failure after a successful save must not masquerade as success: an
+# invisible WINWORD may still be alive and holding the .docx locked. Every
+# cleanup step above still ran; now report it.
+if ($quitError) {{
+    [Console]::Error.WriteLine('WORD_QUIT_FAILED: ' + $quitError + ' (a WINWORD /Automation process may still hold the document; check Task Manager)')
+    exit {quit_failed}
+}}
 '''
+# exit 4 inside the PowerShell child: the work succeeded but Word did not quit.
+_PS_QUIT_FAILED = 4
 
 
 # Reports tocUpdated=true/false on stdout. The PDF is exported ONLY when an
@@ -170,6 +180,7 @@ def _powershell_exe():
 def build_powershell_script(docx, pdf):
     return PS_SAVE_FUNCTION + POWERSHELL_TEMPLATE.format(
         docx=_ps_quote(docx), pdf=_ps_quote(pdf or ''), no_word=_PS_NO_WORD,
+        quit_failed=_PS_QUIT_FAILED,
         save_attempts=SAVE_ATTEMPTS, retry_seconds=SAVE_RETRY_SECONDS)
 
 

@@ -38,8 +38,11 @@ using System; using System.Runtime.InteropServices;
 public class TitFont {
   [DllImport("gdi32.dll", CharSet=CharSet.Unicode)] public static extern int AddFontResource(string f);
   [DllImport("gdi32.dll", CharSet=CharSet.Unicode)] public static extern int RemoveFontResource(string f);
-  [DllImport("user32.dll")] public static extern int SendMessage(IntPtr h, int m, IntPtr w, IntPtr l);
-  public static void Broadcast() { SendMessage((IntPtr)0xffff, 0x001D, IntPtr.Zero, IntPtr.Zero); }
+  [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
+  // WM_FONTCHANGE to every top-level window. A plain SendMessage(HWND_BROADCAST) blocks forever
+  // on one unresponsive window (hit 2026-09-19: an orphan headless WINWORD); SMTO_ABORTIFHUNG
+  // (0x2) + 2 s cap keeps the installer from hanging on someone else's stuck app.
+  public static void Broadcast() { IntPtr r; SendMessageTimeout((IntPtr)0xffff, 0x001D, IntPtr.Zero, IntPtr.Zero, 0x2, 2000, out r); }
 }
 "@
 function Gdi-Add($p)    { if (-not $NoGdi) { [TitFont]::AddFontResource($p)    | Out-Null } }

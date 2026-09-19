@@ -6,8 +6,13 @@ Works with:
   - Standard markdown (GitHub READMEs, hand-written notes, etc.)
 
 Handles:
-  # / ## / ### headings  (# -> Heading 1, ## -> Heading 2; --heading-offset
-                          shifts this. Manual numbers in the heading text are
+  # / ## / ### headings  (# -> Heading 1, ## -> Heading 2. A leading `# Title`
+                          that repeats --title is dropped, since the cover
+                          title is already emitted as the first Heading 1; if
+                          it was the only `#` in the file, `##` chapters are
+                          promoted to Heading 1 automatically. An explicit
+                          --heading-offset disables that detection and shifts
+                          every level. Manual numbers in the heading text are
                           kept and the style's auto-numbering is suppressed so
                           they don't double up.)
   **bold**, *italic*, `inline code`
@@ -60,7 +65,7 @@ from docx.shared import Pt, RGBColor, Cm, Emu, Inches
 # by a stale bundled copy is diagnosable from the file itself: it is written
 # into docProps/custom.xml as the ITQRendererVersion custom property, which
 # Word preserves across save and PDF export.
-__version__ = '1.5.1'
+__version__ = '1.6.1'
 
 
 def warn(msg):
@@ -870,15 +875,30 @@ class ItqRenderer:
     # --- template hygiene ----------------------------------------------------
 
     def clear_template_demo(self):
-        """Remove the 'Introduction / Subheading 1 / Subheading 2' demo
-        section and the 4-column demo table that the template ships with."""
-        if len(self.d.tables) >= 2:
-            demo = self.d.tables[1]._tbl
-            demo.getparent().remove(demo)
-        for idx in range(32, 22, -1):
-            if idx < len(self.d.paragraphs):
-                p = self.d.paragraphs[idx]
-                p._p.getparent().remove(p._p)
+        """Remove the demo body the template ships with: everything from the
+        first Heading 1 paragraph ('Introduction') to the end of the body,
+        demo table included, content controls excepted. Anchoring on the style rather than on paragraph
+        indexes keeps this correct across template revisions (the 2026-09-16
+        template dropped the demo table and the Subheading paragraphs)."""
+        body = self.d.element.body
+        start = None
+        for i, child in enumerate(body):
+            if child.tag != qn('w:p'):
+                continue
+            pPr = child.find(qn('w:pPr'))
+            pStyle = pPr.find(qn('w:pStyle')) if pPr is not None else None
+            if pStyle is not None and pStyle.get(qn('w:val')) == 'Heading1':
+                start = i
+                break
+        if start is None:
+            return
+        # Keep the section properties and any block-level content control:
+        # the template parks the ManagementSummary control inside the demo
+        # section, right under 'Introduction', and --summary fills it later.
+        keep = (qn('w:sectPr'), qn('w:sdt'))
+        for child in list(body)[start:]:
+            if child.tag not in keep:
+                body.remove(child)
 
     def fill_version_history(self, rows):
         vh = self.d.tables[0]
@@ -891,6 +911,23 @@ class ItqRenderer:
         while len(vh.rows) > 1 + len(rows):
             last = vh.rows[-1]._tr
             last.getparent().remove(last)
+
+    def add_summary_heading(self, text):
+        """Put a heading directly above the management-summary control, in
+        the style the template uses for its other pre-body headings
+        ('Version history', 'Table of content'). ITQ Kop 1 is not an outline
+        level, so the TOC is unaffected. No-op if the template has no
+        tagged control or text is empty."""
+        if not text:
+            return
+        for sdt in self.d.element.body.iterchildren(qn('w:sdt')):
+            pr = sdt.find(qn('w:sdtPr'))
+            tag = pr.find(qn('w:tag')) if pr is not None else None
+            if tag is not None and tag.get(qn('w:val')) == 'ManagementSummary':
+                p = self.d.add_paragraph(style='ITQ Kop 1')
+                p.add_run(text)
+                sdt.addprevious(p._p)
+                return
 
     def save(self, path):
         self.d.save(path)
@@ -1199,7 +1236,7 @@ def _insert_cover_classification_rows(raw_bytes, classification):
 
 def _append_footer_classification(raw_bytes, classification):
     """Append ' | CLASSIFICATION' to the end of the footer's page-number
-    line, reusing the run formatting already used there (Titillium Web,
+    line, reusing the run formatting already used there (Titillium,
     Royal Blue, 8pt) so it reads as part of the same footer text. No-op
     (byte-identical passthrough) when classification is empty."""
     if not classification:
@@ -1275,6 +1312,69 @@ def postprocess_docx(path, meta):
 
 # ---------- Orchestration -----------------------------------------------------
 
+def _norm_title(text):
+    """Case-, whitespace- and punctuation-insensitive form for title matching
+    (Unicode letters and digits kept, so non-Latin titles compare too)."""
+    return re.sub(r'[\W_]+', '', text.casefold())
+
+
+_TITLE_PREFIXES = ('itq',)   # "ITQ Vibe Coding Policy" == "Vibe Coding Policy"
+
+
+def _titles_match(a, b):
+    """Equal after normalisation, optionally ignoring a known company prefix
+    on either side. Deliberately NOT substring matching: "Security" must not
+    match "Security policy", or a real chapter would be deleted."""
+    a, b = _norm_title(a), _norm_title(b)
+    if not a or not b:
+        return False
+    def strip(t):
+        for pre in _TITLE_PREFIXES:
+            if t.startswith(pre) and len(t) > len(pre):
+                return t[len(pre):]
+        return t
+    return a == b or strip(a) == strip(b)
+
+
+def plan_headings(blocks, title, source_name='<markdown>'):
+    """Decide how markdown heading levels map onto Word heading levels.
+
+    Returns (blocks, offset). The renderer always emits --title as the first
+    Heading 1, so a body that opens with the same `# Title` would print it
+    twice and push every chapter one level too deep. Two conventions are in
+    the wild and both must come out right without flags:
+
+      standard   `# 1. Chapter` / `## 1.1 Section`            -> offset 0
+      title-led  `# Title` / `## 1. Chapter` / `### Section`  -> title dropped,
+                                                                 offset -1
+
+    Detection is deliberately narrow: only a `#` that is the FIRST block of
+    the document and whose text equals --title (case, punctuation and an
+    "ITQ " prefix ignored; never substring matching) is ever dropped, and
+    the shift only happens when it was the sole `#`. A sole `#` that does NOT
+    match the title is kept as a chapter and flagged, since "Executive
+    summary" followed by `##` sections is a legitimate document.
+    """
+    heads = [b for b in blocks if b.kind == 'heading']
+    if not blocks or not heads or blocks[0] is not heads[0] or heads[0].level != 1:
+        return blocks, 0
+    first = heads[0]
+    matches = _titles_match(first.text, title)
+    sole = len(heads) > 1 and all(h.level != 1 for h in heads[1:])
+    if not matches:
+        if sole:
+            warn("%s: sole '#' heading %r differs from --title %r; kept as a "
+                 "Heading 1 chapter. If it is the document title, make them "
+                 "match or pass --heading-offset -1." % (source_name, first.text, title))
+        return blocks, 0
+    remaining = [b for b in blocks if b is not first]
+    offset = -1 if sole else 0
+    warn("%s: dropped body heading %r (repeats --title)%s" % (
+        source_name, first.text,
+        "; '##' chapters mapped to Heading 1" if offset else ''))
+    return remaining, offset
+
+
 def render(template, source_md, out_path, meta):
     asset_dir = os.path.join(os.path.dirname(out_path), 'assets')
     # meta['source_path'] (the .md file) anchors relative image paths and
@@ -1287,18 +1387,22 @@ def render(template, source_md, out_path, meta):
                     source_name=source_name)
     r.fill_version_history(meta['version_history'])
     r.clear_template_demo()
-
-    # Markdown heading level -> Word heading level. Default offset 0 means
-    # standard markdown (# -> Heading 1, ## -> Heading 2, ### -> Heading 3).
-    # Pass offset -1 for Notion-export markdown, where the page title is a
-    # single leading `#` and real sections start at `##` (reproduces the old
-    # behaviour: ## -> Heading 1).
-    offset = meta.get('heading_offset', 0)
+    if meta.get('summary'):
+        r.add_summary_heading(meta.get('summary_heading', 'Management summary'))
 
     # Document title as first Heading 1
     r.add_heading(1, meta['title_cover'])
 
     blocks = parse_blocks(source_md, source_name=source_name)
+
+    # Markdown heading level -> Word heading level. Offset 0 is standard
+    # markdown (# -> Heading 1, ## -> Heading 2, ### -> Heading 3); -1 is the
+    # Notion-export convention (## -> Heading 1). None (the CLI default) means
+    # auto: drop a leading `# Title` that repeats --title and, when it was the
+    # only `#`, promote `##` chapters to Heading 1. See plan_headings().
+    offset = meta.get('heading_offset')
+    if offset is None:
+        blocks, offset = plan_headings(blocks, meta['title_cover'], source_name)
     for b in blocks:
         if b.kind == 'heading':
             r.add_heading(max(1, b.level + offset), b.text)
@@ -1362,14 +1466,22 @@ def _build_cli():
                         'on the cover and title page, and a short uppercase label '
                         'in the footer of every body page. Omit for no change to '
                         'the output (default behaviour).')
-    p.add_argument('--heading-offset', type=int, default=0,
+    p.add_argument('--heading-offset', type=int, default=None,
                    help='Shift markdown heading levels onto Word heading levels. '
-                        '0 (default) = standard markdown (# -> Heading 1). '
-                        '-1 = Notion-export markdown (## -> Heading 1).')
+                        'Default: auto-detect (a leading "# Title" that repeats '
+                        '--title is dropped; if it was the only "#", "##" chapters '
+                        'become Heading 1). 0 = literal standard markdown '
+                        '(# -> Heading 1, no detection). -1 = Notion-export '
+                        'markdown (## -> Heading 1, no detection).')
     p.add_argument('--summary', default=None,
                    help='Management-summary text, OR a path to a .md/.txt file '
                         'whose contents become the summary. Fills the template '
                         "control tagged 'ManagementSummary'. Omit to leave blank.")
+    p.add_argument('--summary-heading', default='Management summary',
+                   help='Heading placed above the management summary when '
+                        '--summary is given (template pre-body style, not in '
+                        'the TOC). Pass "" for no heading. '
+                        'Default: "Management summary".')
     p.add_argument('--version-history', action='append', default=None,
                    metavar='VER|DATE|AUTHOR|CHANGES',
                    help='Version history row, pipe-separated. Repeat for '
@@ -1415,6 +1527,7 @@ if __name__ == '__main__':
         'summary':         summary,
         'version_history': _parse_history(args.version_history),
         'heading_offset':  args.heading_offset,
+        'summary_heading': args.summary_heading,
         'source_path':     args.source,
     }
 

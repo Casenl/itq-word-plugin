@@ -21,21 +21,37 @@ builds are for ITQ's internal use.
 """
 import argparse
 import glob
+import logging
 import os
 import sys
 
-from fontTools.pens.cu2quPen import Cu2QuPen
+# The source Titillium 'fraction' glyph has a 65507-unit advance (a source defect,
+# carried over unchanged); fontTools warns about it on every build. Keep stderr to
+# real errors so PowerShell callers do not mistake the warning for a failure.
+logging.getLogger('fontTools').setLevel(logging.ERROR)
+
+from fontTools.pens.cu2quPen import Cu2QuPen  # noqa: E402
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.ttLib import TTFont, newTable
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_OUT = os.path.join(HERE, 'fonts', 'ttf')
-DEFAULT_SRC = [
+# The official OTFs shipped with this script come first: <dir>/fonts/otf next to the
+# script (repo, itq-word-plugin) or one level up (portable skill keeps scripts/ apart).
+# Installed fonts and the itq-design skill are fallbacks for a bare checkout.
+LOCAL_OTF = [os.path.join(HERE, 'fonts', 'otf'), os.path.join(os.path.dirname(HERE), 'fonts', 'otf')]
+DEFAULT_SRC = LOCAL_OTF + [
     os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'Windows', 'Fonts'),
     os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts'),
     os.path.join(os.path.expanduser('~'), '.claude', 'skills', 'itq-design', 'fonts'),
-    os.path.join(HERE, 'fonts', 'otf'),
 ]
+
+
+def default_out():
+    """fonts/ttf beside whichever fonts/otf is shipped with this script."""
+    for d in LOCAL_OTF:
+        if os.path.isdir(d):
+            return os.path.join(os.path.dirname(d), 'ttf')
+    return os.path.join(HERE, 'fonts', 'ttf')
 MAX_ERR = 1.0  # font units at 1000 upem; visually lossless
 
 
@@ -120,7 +136,7 @@ def main(argv=None):
     ap.add_argument('--src', action='append', metavar='DIR',
                     help='directory holding Titillium-*.otf (repeatable; default: per-user fonts, '
                          'C:\\Windows\\Fonts, the itq-design skill fonts/, ./fonts/otf)')
-    ap.add_argument('--out', default=DEFAULT_OUT, metavar='DIR', help='output directory (default: fonts/ttf next to this script)')
+    ap.add_argument('--out', default=None, metavar='DIR', help='output directory (default: fonts/ttf beside the shipped fonts/otf)')
     ap.add_argument('--one', nargs=2, metavar=('IN.otf', 'OUT.ttf'), help='convert a single file instead')
     ap.add_argument('--rename', metavar='FAMILY', help='with --one: rename the family (probes only)')
     args = ap.parse_args(argv)
@@ -133,14 +149,15 @@ def main(argv=None):
     sources = find_sources(args.src or DEFAULT_SRC)
     if not sources:
         print('build_titillium_ttf: no Titillium-*.otf found in: %s\n'
-              'Install the Titillium OTFs (itq-design skill, fonts/) or pass --src DIR.'
+              'Ship fonts/otf next to this script (see NOTICE.md) or pass --src DIR.'
               % ', '.join(args.src or DEFAULT_SRC), file=sys.stderr)
         return 1
+    out = args.out or default_out()
     for base, src in sources.items():
-        dst = os.path.join(args.out, base[:-4] + '.ttf')
+        dst = os.path.join(out, base[:-4] + '.ttf')
         fam, sub, ps = convert_one(src, dst)
         print('%-32s family="%s" style="%s" ps="%s"  <- %s' % (os.path.basename(dst), fam, sub, ps, src))
-    print('%d face(s) written to %s' % (len(sources), os.path.abspath(args.out)))
+    print('%d face(s) written to %s' % (len(sources), os.path.abspath(out)))
     return 0
 
 

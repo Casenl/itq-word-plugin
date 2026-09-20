@@ -1,30 +1,36 @@
 <#
 .SYNOPSIS
-  Make Word on Windows render and embed the real ITQ brand font "Titillium".
+  Make Word on Windows render and embed the ITQ brand font "Titillium".
 
 .DESCRIPTION
   Word's PDF export on Windows silently substitutes Calibri for CFF/OpenType (.otf)
-  fonts - verified 2026-09-18 on Michel's workstation with an unrelated system-wide
-  OTF as control. It handles TrueType (.ttf) fine. This script replaces the per-user
-  registration of the Titillium .otf faces with the TrueType builds produced by
-  build_titillium_ttf.py (same outlines, same family/style names), so a document that
-  names "Titillium" exports a PDF that actually embeds Titillium. No admin needed.
-  The .otf files stay on disk; -Rollback restores the previous registration exactly.
+  fonts - verified 2026-09-18/19 on an ITQ workstation, per-user and all-users installs
+  alike, with an unrelated system-wide OTF as control. It handles TrueType (.ttf) fine.
 
-  Fonts are looked up in fonts\ttf next to this script, or one level up (the
-  portable skill keeps the script under scripts\ and the fonts under fonts\ttf).
+  This script converts the OFFICIAL Titillium OTFs shipped in fonts\otf to TrueType ON
+  THIS MACHINE (build_titillium_ttf.py, same outlines, metrics and names; needs Python
+  with fonttools) into fonts\ttf, then registers those faces for the current user in
+  place of any .otf registration of the same names. No admin needed. Nothing modified is
+  ever distributed: the .ttf files exist only where they were built. The .otf files stay
+  on disk; -Rollback restores the previous registration exactly.
 
-  .\install_titillium_ttf.ps1              # install / replace (safe to re-run)
+  Layouts: fonts\otf (and fonts\ttf) next to this script, or one level up (the portable
+  skill keeps scripts\ apart). A fonts\ttf that already holds all seven faces is reused.
+
+  .\install_titillium_ttf.ps1              # convert if needed, install / replace (safe to re-run)
+  .\install_titillium_ttf.ps1 -Rebuild     # force a fresh conversion first
   .\install_titillium_ttf.ps1 -DryRun      # show what would happen, change nothing
-  .\install_titillium_ttf.ps1 -Rollback    # restore the .otf registration
+  .\install_titillium_ttf.ps1 -Rollback    # restore the previous registration
 
-  -UserFonts / -RegKey / -FontDir / -NoGdi exist for the test-suite (temp dir,
-  throwaway HKCU key, no GDI session calls); leave them alone in normal use.
+  -Python names the interpreter (default: python on PATH). -UserFonts / -RegKey /
+  -FontDir / -NoGdi exist for the test-suite; leave them alone in normal use.
 #>
 param(
   [switch]$Rollback,
   [switch]$DryRun,
+  [switch]$Rebuild,
   [string]$FontDir,
+  [string]$Python = 'python',
   [string]$UserFonts = (Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Fonts'),
   [string]$RegKey = 'HKCU:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts',
   [switch]$NoGdi
@@ -63,15 +69,38 @@ $Faces = [ordered]@{
   'Titillium Bold Italic (TrueType)'     = 'Titillium-BoldItalic.ttf'
   'Titillium Light (TrueType)'           = 'Titillium-Light.ttf'
 }
-
-if (-not $Rollback -and -not $FontDir) {
-  # Rollback needs only the backup + installed files, never the download.
-  foreach ($cand in @((Join-Path $Here 'fonts\ttf'), (Join-Path (Split-Path -Parent $Here) 'fonts\ttf'))) {
-    if (Test-Path $cand) { $FontDir = (Resolve-Path $cand).Path; break }
-  }
-  if (-not $FontDir) { throw "no fonts\ttf next to or above $Here - run: python build_titillium_ttf.py" }
+function Complete-TtfDir($dir) {
+  if (-not $dir -or -not (Test-Path $dir)) { return $false }
+  foreach ($f in $Faces.Values) { if (-not (Test-Path (Join-Path $dir $f))) { return $false } }
+  return $true
 }
 
+# ---------------------------------------------------------------- source discovery (install only)
+$OtfDir = $null; $Builder = $null; $NeedBuild = $false
+if (-not $Rollback -and -not $FontDir) {
+  $roots = @($Here, (Split-Path -Parent $Here))
+  foreach ($r in $roots) { $c = Join-Path $r 'fonts\otf'; if (-not $OtfDir -and (Test-Path (Join-Path $c 'Titillium-Regular.otf'))) { $OtfDir = (Resolve-Path $c).Path } }
+  foreach ($r in $roots) { $c = Join-Path $r 'fonts\ttf'; if (-not $FontDir -and -not $Rebuild -and (Complete-TtfDir $c)) { $FontDir = (Resolve-Path $c).Path } }
+  if (-not $FontDir) {
+    if (-not $OtfDir) { throw "no fonts\otf (official Titillium OTFs) next to or above $Here - the bundle is incomplete, re-download it" }
+    $Builder = Join-Path $Here 'build_titillium_ttf.py'
+    if (-not (Test-Path $Builder)) { throw "missing $Builder next to this script - the bundle is incomplete, re-download it" }
+    $FontDir = Join-Path (Split-Path -Parent $OtfDir) 'ttf'
+    $NeedBuild = $true
+  }
+}
+
+function Assert-PythonWithFonttools {
+  $ok = $false
+  try { & $Python -c "import fontTools" 2>$null; $ok = ($LASTEXITCODE -eq 0) } catch { $ok = $false }
+  if (-not $ok) {
+    throw ("Converting the official Titillium OTFs to TrueType needs Python with the fonttools package " +
+           "(interpreter tried: '$Python'). Install Python 3, then run:  $Python -m pip install fonttools  " +
+           "and re-run this script. Nothing was changed.")
+  }
+}
+
+# ---------------------------------------------------------------- previews
 if ($DryRun -and $Rollback) {
   if (-not (Test-Path $Backup)) { throw "no backup at $Backup - nothing to roll back" }
   $prev = Get-Content $Backup -Raw | ConvertFrom-Json
@@ -84,19 +113,21 @@ if ($DryRun -and $Rollback) {
   }
   "Dry run - nothing changed."; exit 0
 }
-
 if ($DryRun) {
-  "font source : $FontDir"
+  "official otf: $(if ($OtfDir) { $OtfDir } else { '(none found; using -FontDir)' })"
+  "truetype dir: $FontDir $(if ($NeedBuild) { '(will be BUILT here from the official OTFs on this machine)' } else { '(prebuilt, reused)' })"
+  if ($NeedBuild) { "converter   : $Builder via '$Python' (needs fonttools)" }
   "user fonts  : $UserFonts $(if (Test-Path $UserFonts) {''} else {'(will be created)'})"
   "registry    : $RegKey $(if (Test-Path $RegKey) {''} else {'(will be created)'})"
   foreach ($name in $Faces.Keys) {
     $src = Join-Path $FontDir $Faces[$name]
-    $state = if (Test-Path $src) { 'ok' } else { 'MISSING' }
+    $state = if ($NeedBuild) { 'to build' } elseif (Test-Path $src) { 'ok' } else { 'MISSING' }
     "  {0,-38} {1}  [{2}]  currently: {3}" -f $name, $src, $state, (Reg-Get $name)
   }
   "Dry run - nothing changed."; exit 0
 }
 
+# ---------------------------------------------------------------- rollback
 if ($Rollback) {
   if (-not (Test-Path $Backup)) { throw "no backup at $Backup - nothing to roll back" }
   $prev = Get-Content $Backup -Raw | ConvertFrom-Json
@@ -119,9 +150,26 @@ if ($Rollback) {
   "Rolled back. Restart Word to pick up the change."; exit 0
 }
 
-foreach ($name in $Faces.Keys) {
-  if (-not (Test-Path (Join-Path $FontDir $Faces[$name]))) { throw "missing $($Faces[$name]) in $FontDir - run: python build_titillium_ttf.py" }
+# ---------------------------------------------------------------- local conversion
+if ($NeedBuild) {
+  Assert-PythonWithFonttools
+  "converting the official Titillium OTFs in $OtfDir to TrueType on this machine -> $FontDir"
+  # Anything the converter prints on stderr would become a terminating NativeCommandError
+  # under 'Stop'; judge it by its exit code instead.
+  $ErrorActionPreference = 'Continue'
+  $out = & $Python $Builder --src $OtfDir --out $FontDir 2>&1
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = 'Stop'
+  $out | ForEach-Object { "  $_" }
+  if ($code -ne 0) { throw "build_titillium_ttf.py failed (exit $code); nothing was registered" }
+  if (-not (Complete-TtfDir $FontDir)) { throw "conversion did not produce all seven faces in $FontDir" }
+  "built 7 TrueType faces (private copies for this machine; not for redistribution)"
 }
+foreach ($name in $Faces.Keys) {
+  if (-not (Test-Path (Join-Path $FontDir $Faces[$name]))) { throw "missing $($Faces[$name]) in $FontDir - run with -Rebuild" }
+}
+
+# ---------------------------------------------------------------- install
 # Fresh profiles have neither the per-user Fonts folder nor the HKCU Fonts key yet.
 if (-not (Test-Path $UserFonts)) { New-Item -ItemType Directory -Path $UserFonts -Force | Out-Null; "created $UserFonts" }
 if (-not (Test-Path $RegKey))    { New-Item -Path $RegKey -Force | Out-Null; "created $RegKey" }

@@ -8,7 +8,9 @@ Works with:
 Handles:
   # / ## / ### headings  (# -> Heading 1, ## -> Heading 2. A leading `# Title`
                           that repeats --title is dropped, since the cover
-                          title is already emitted as the first Heading 1; if
+                          title is emitted as the first Heading 1 (left out
+                          when the body opens with a Heading 1, which would
+                          make it an empty page); if
                           it was the only `#` in the file, `##` chapters are
                           promoted to Heading 1 automatically. An explicit
                           --heading-offset disables that detection and shifts
@@ -65,7 +67,7 @@ from docx.shared import Pt, RGBColor, Cm, Emu, Inches
 # by a stale bundled copy is diagnosable from the file itself: it is written
 # into docProps/custom.xml as the ITQRendererVersion custom property, which
 # Word preserves across save and PDF export.
-__version__ = '1.6.1'
+__version__ = '1.6.2'
 
 
 def warn(msg):
@@ -1390,9 +1392,6 @@ def render(template, source_md, out_path, meta):
     if meta.get('summary'):
         r.add_summary_heading(meta.get('summary_heading', 'Management summary'))
 
-    # Document title as first Heading 1
-    r.add_heading(1, meta['title_cover'])
-
     blocks = parse_blocks(source_md, source_name=source_name)
 
     # Markdown heading level -> Word heading level. Offset 0 is standard
@@ -1403,6 +1402,17 @@ def render(template, source_md, out_path, meta):
     offset = meta.get('heading_offset')
     if offset is None:
         blocks, offset = plan_headings(blocks, meta['title_cover'], source_name)
+
+    # Document title as the first Heading 1, but only when it heads content of
+    # its own (a preface, or `##` sections under it). Heading 1 starts a new
+    # page in the ITQ template, so a title directly followed by the body's
+    # first chapter would be an empty page plus a stray TOC entry; the cover,
+    # header and footer already carry the title.
+    first = blocks[0] if blocks else None
+    if not (first is not None and first.kind == 'heading'
+            and max(1, first.level + offset) == 1):
+        r.add_heading(1, meta['title_cover'])
+
     for b in blocks:
         if b.kind == 'heading':
             r.add_heading(max(1, b.level + offset), b.text)

@@ -67,7 +67,7 @@ from docx.shared import Pt, RGBColor, Cm, Emu, Inches
 # by a stale bundled copy is diagnosable from the file itself: it is written
 # into docProps/custom.xml as the ITQRendererVersion custom property, which
 # Word preserves across save and PDF export.
-__version__ = '1.6.2'
+__version__ = '1.6.3'
 
 
 def warn(msg):
@@ -443,6 +443,7 @@ def parse_blocks(text, source_name='<markdown>'):
 
         m = re.match(r'^(\d+)\.\s+(.*)$', stripped)
         if m:
+            start = int(m.group(1))
             items = []
             while i < n:
                 mm = re.match(r'^(\d+)\.\s+(.*)$', lines[i].strip())
@@ -452,7 +453,7 @@ def parse_blocks(text, source_name='<markdown>'):
                 i += 1
             items = [it for it in items if it]
             if items:
-                blocks.append(Block('olist', items=items))
+                blocks.append(Block('olist', items=items, start=start))
             continue
 
         if stripped.startswith('- ') or stripped.startswith('* '):
@@ -641,6 +642,7 @@ class ItqRenderer:
         ITQNumbering styleLink and actual <w:lvl> definitions."""
         self.bullet_numid = None
         self.num_numid = None
+        self.num_absid = None
         numbering = self.d.part.numbering_part.element
         w = numbering.nsmap['w']
 
@@ -662,6 +664,7 @@ class ItqRenderer:
         # Step 2: find the first numId that targets each abstract num
         bullet_abs = style_to_absid.get('ITQBullets')
         num_abs = style_to_absid.get('ITQNumbering')
+        self.num_absid = num_abs
 
         for num in numbering.findall(qn('w:num')):
             nid = num.get(qn('w:numId'))
@@ -672,6 +675,25 @@ class ItqRenderer:
                 self.bullet_numid = nid
             if target == num_abs and self.num_numid is None:
                 self.num_numid = nid
+
+    def restart_numbering(self):
+        """Start a new numbered list at 1: add a w:num on the ITQ Numbering
+        abstractNum with a startOverride, and use it for the next items.
+        Without this every ordered list shares one numId and keeps counting
+        across the whole document."""
+        if self.num_absid is None:
+            return
+        numbering = self.d.part.numbering_part.element
+        ids = [int(n.get(qn('w:numId'))) for n in numbering.findall(qn('w:num'))]
+        new_id = str(max(ids + [0]) + 1)
+        num = OxmlElement('w:num'); num.set(qn('w:numId'), new_id)
+        abs_ref = OxmlElement('w:abstractNumId'); abs_ref.set(qn('w:val'), self.num_absid)
+        num.append(abs_ref)
+        ovr = OxmlElement('w:lvlOverride'); ovr.set(qn('w:ilvl'), '0')
+        so = OxmlElement('w:startOverride'); so.set(qn('w:val'), '1')
+        ovr.append(so); num.append(ovr)
+        numbering.append(num)
+        self.num_numid = new_id
 
     def _apply_list(self, para, numid):
         pPr = para._p.get_or_add_pPr()
@@ -1423,6 +1445,10 @@ def render(template, source_md, out_path, meta):
         elif b.kind == 'ulist':
             for item in b.items: r.add_bullet(item)
         elif b.kind == 'olist':
+            # A list that starts at 1 in markdown starts at 1 in Word; a list
+            # continued with 2. or higher keeps the previous numbering.
+            if getattr(b, 'start', 1) == 1:
+                r.restart_numbering()
             for item in b.items: r.add_numbered(item)
         elif b.kind == 'callout':
             r.add_callout(b.icon, b.color, b.text)
